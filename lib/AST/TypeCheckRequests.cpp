@@ -2860,6 +2860,79 @@ std::optional<StringRef> SectionForDeclRequest::evaluate(
 }
 
 //----------------------------------------------------------------------------//
+// DisabledInstrumentationForDeclRequest computation.
+//----------------------------------------------------------------------------//
+
+/// Combine the explicit @instrumentation attributes with the settings
+/// propagated from the enclosing scope. '@instrumentation(default)' discards
+/// the propagated settings; 'disable:' adds to what remains.
+static InstrumentationMask
+applyInstrumentationAttrs(const DeclAttributes &attrs,
+                          InstrumentationMask inherited) {
+  InstrumentationMask disabled = 0;
+  bool reset = false;
+  for (auto *attr : attrs.getAttributes<InstrumentationAttr>()) {
+    reset |= attr->IsDefault;
+    disabled |= attr->DisabledKinds;
+  }
+  return (reset ? 0 : inherited) | disabled;
+}
+
+/// Infer the disabled instrumentation for an entity based on the function or
+/// closure that encloses it, if there is one.
+static InstrumentationMask
+inferInstrumentationFromEnclosingContext(const DeclContext *dc) {
+  while (dc) {
+    if (auto afd = dyn_cast<AbstractFunctionDecl>(dc))
+      return afd->getDisabledInstrumentation();
+    if (auto ace = dyn_cast<AbstractClosureExpr>(dc))
+      return ace->getDisabledInstrumentation();
+
+    // Look through initializer contexts (default arguments, variable
+    // initializers) to the entity they belong to, as for '@section'.
+    if (isa<Initializer>(dc)) {
+      dc = dc->getParent();
+      continue;
+    }
+
+    break;
+  }
+
+  return 0;
+}
+
+InstrumentationMask DisabledInstrumentationForDeclRequest::evaluate(
+    Evaluator &evaluator,
+    llvm::PointerUnion<const Decl *, const AbstractClosureExpr *>
+        declOrClosure) const {
+  if (auto closure = declOrClosure.dyn_cast<const AbstractClosureExpr *>()) {
+    InstrumentationMask inherited =
+        inferInstrumentationFromEnclosingContext(closure->getParent());
+    if (auto explicitClosure = dyn_cast<ClosureExpr>(closure))
+      return applyInstrumentationAttrs(explicitClosure->getAttrs(), inherited);
+    return inherited;
+  }
+
+  auto decl = cast<const Decl *>(declOrClosure);
+
+  // An accessor is affected by the attributes on the subscript that it
+  // belongs to, as well as its own.
+  InstrumentationMask inherited;
+  auto accessor = dyn_cast<AccessorDecl>(decl);
+  if (accessor && isa<SubscriptDecl>(accessor->getStorage()))
+    inherited = accessor->getStorage()->getDisabledInstrumentation();
+  else
+    inherited = inferInstrumentationFromEnclosingContext(decl->getDeclContext());
+
+  // Only functions and subscripts propagate into nested closures and local
+  // functions; other declarations (e.g., a type) never do.
+  if (!isa<AbstractFunctionDecl>(decl) && !isa<SubscriptDecl>(decl))
+    return 0;
+
+  return applyInstrumentationAttrs(decl->getAttrs(), inherited);
+}
+
+//----------------------------------------------------------------------------//
 // UniqueUnderlyingTypeSubstitutionsRequest computation.
 //----------------------------------------------------------------------------//
 
